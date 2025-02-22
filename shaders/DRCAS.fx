@@ -63,7 +63,7 @@
 
 */
 
-*\
+/*
 	Modifications of cRCAS by 0CCULTIST:
 	1. Implemented [d]iamond sampling pattern which completely avoids sharpening of fine details such as dithering patterns.
 	2. Increase pixel sharpening limit slightly to help avoid over-equalization.
