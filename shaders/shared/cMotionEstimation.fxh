@@ -13,13 +13,36 @@
         - The post-filter median filter is 2^3 pixels wide.
         - This idea is based off depth-of-field undersampling and using a post-filter median on the undersampled regions.
     */
-    float4 CMotionEstimation_GetDilatedPyramidUpsample(sampler2D Source, float2 Tex)
+    float4 CMotionEstimation_GetDilatedPyramidUpsample(sampler2D SampleSource, float2 Tex)
     {
-        return CBlur_FilterMotionVectors(Source, Tex, 3.0, false);
+        // A0 B0 C0
+        // A1 B1 C1
+        // A2 B2 C2
+        float2 Delta = fwidth(Tex) * exp2(2.0);
+        float4 Tex0 = Tex.xyyy + (float4(-2.0, 2.0, 0.0, -2.0) * Delta.xyyy);
+        float4 Tex1 = Tex.xyyy + (float4(0.0, 2.0, 0.0, -2.0) * Delta.xyyy);
+        float4 Tex2 = Tex.xyyy + (float4(2.0, 2.0, 0.0, -2.0) * Delta.xyyy);
+
+        float4 Sum = 0.0;
+        float Weight = 1.0 / 9.0;
+        Sum += (tex2D(SampleSource, Tex0.xy) * Weight);
+        Sum += (tex2D(SampleSource, Tex0.xz) * Weight);
+        Sum += (tex2D(SampleSource, Tex0.xw) * Weight);
+        Sum += (tex2D(SampleSource, Tex1.xy) * Weight);
+        Sum += (tex2D(SampleSource, Tex1.xz) * Weight);
+        Sum += (tex2D(SampleSource, Tex1.xw) * Weight);
+        Sum += (tex2D(SampleSource, Tex2.xy) * Weight);
+        Sum += (tex2D(SampleSource, Tex2.xz) * Weight);
+        Sum += (tex2D(SampleSource, Tex2.xw) * Weight);
+
+        return Sum;
     }
 
     /*
         Lucas-Kanade optical flow with bilinear fetches.
+        ---
+        Gauss-Newton Steepest Descent Inverse Additive Algorithm
+        https://www.ri.cmu.edu/pub_files/pub3/baker_simon_2002_3/baker_simon_2002_3.pdf
         ---
         The algorithm is motified to not output in pixels, but normalized displacements
         ---
@@ -36,8 +59,8 @@
         float2 MainPos,
         float2 MainTex,
         float2 Vectors,
-        sampler2D SampleI0,
-        sampler2D SampleI1
+        sampler2D SampleT,
+        sampler2D SampleI
     )
     {
         // Initialize variables
@@ -56,7 +79,7 @@
 
         // Calculate warped texture coordinates
         WarpTex.zw -= 0.5; // Pull into [-0.5, 0.5) range
-        WarpTex.zw += Vectors; // Warp in [-HalfMax, HalfMax) range
+        WarpTex.zw -= Vectors; // Inverse warp in the [-0.5, 0.5) range
         WarpTex.zw = saturate(WarpTex.zw + 0.5); // Push and clamp into [0.0, 1.0) range
 
         // Get gradient information
@@ -82,19 +105,19 @@
 
             // Get temporal gradient
             float4 TexIT = WarpTex.xyzw + (Kernel.xyxy * PixelSize.xyxy);
-            float2 I0 = tex2Dgrad(SampleI0, TexIT.xy, TexIx.xy, TexIy.xy).rg;
-            float2 I1 = tex2Dgrad(SampleI1, TexIT.zw, TexIx.zw, TexIy.zw).rg;
-            float2 IT = I0 - I1;
+            float2 T = tex2Dgrad(SampleT, TexIT.xy, TexIx.xy, TexIy.xy).rg;
+            float2 I = tex2Dgrad(SampleI, TexIT.zw, TexIx.zw, TexIy.zw).rg;
+            float2 IT = I - T;
 
             // Get spatial gradient
             float4 OffsetNS = Kernel.xyxy + float4(0.0, -1.0, 0.0, 1.0);
             float4 OffsetEW = Kernel.xyxy + float4(-1.0, 0.0, 1.0, 0.0);
             float4 NS = WarpTex.xyxy + (OffsetNS * PixelSize.xyxy);
             float4 EW = WarpTex.xyxy + (OffsetEW * PixelSize.xyxy);
-            float2 N = tex2Dgrad(SampleI0, NS.xy, TexIx.xy, TexIy.xy).rg;
-            float2 S = tex2Dgrad(SampleI0, NS.zw, TexIx.xy, TexIy.xy).rg;
-            float2 E = tex2Dgrad(SampleI0, EW.xy, TexIx.xy, TexIy.xy).rg;
-            float2 W = tex2Dgrad(SampleI0, EW.zw, TexIx.xy, TexIy.xy).rg;
+            float2 N = tex2Dgrad(SampleT, NS.xy, TexIx.xy, TexIy.xy).rg;
+            float2 S = tex2Dgrad(SampleT, NS.zw, TexIx.xy, TexIy.xy).rg;
+            float2 E = tex2Dgrad(SampleT, EW.xy, TexIx.xy, TexIy.xy).rg;
+            float2 W = tex2Dgrad(SampleT, EW.zw, TexIx.xy, TexIy.xy).rg;
             float2 Ix = E - W;
             float2 Iy = N - S;
 
@@ -115,13 +138,22 @@
             [-IxIy/D  Iy^2/D] [-IyIt]
         */
 
-        // Calculate A^-1 and B
-        float D = determinant(float2x2(IxIx, IxIy, IxIy, IyIy));
-        float2x2 A = float2x2(IyIy, -IxIy, -IxIy, IxIx) / D;
-        float2 B = float2(-IxIt, -IyIt);
+        /*
+            Calculate Lucas-Kanade matrix
+        */
 
-        // Calculate A^T*B
-        float2 Flow = (D > 0.0) ? mul(B, A) : 0.0;
+        // Construct matrices
+        float2x2 A = float2x2(IxIx, IxIy, IxIy, IyIy);
+        float2 B = float2(IxIt, IyIt);
+
+        // Calculate C factor
+        float N = dot(B, B);
+        float2 DotBA = float2(dot(B, A[0]), dot(B, A[1]));
+        float D = dot(DotBA, B);
+        float C = N / D;
+
+        // Calculate -C*B
+        float2 Flow = (D > 0.0) ? -mul(C, B) : 0.0;
 
         // Normalize motion vectors
         Flow *= PixelSize;
